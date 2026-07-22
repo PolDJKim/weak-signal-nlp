@@ -1,1 +1,54 @@
+# [4단계] 의미 연결망 분석 (SNA) 및 중심성 지표 산출 알고리즘
+import pandas as pd
+import numpy as np
+import networkx as nx
+from sklearn.feature_extraction.text import CountVectorizer
 
+print("[*] 2단계(정제 데이터) 및 3단계(궤적추적 매트릭스) 파일을 불러오는 중...")
+try:
+    df_clean = pd.read_csv("naver_news_comments_cleaned.csv")
+    signal_df = pd.read_csv("naver_news_kem_kim_matrix.csv")
+    
+    vocab = signal_df['Keyword'].tolist() # 3단계에서 확정된 공통 단어장(Keyword)을 리스트로 쏙 뽑아서 기준점으로 삼음
+except FileNotFoundError:
+    print("[-] 필요 파일이 없습니다. 2단계와 3단계를 먼저 실행해 주세요.")
+
+# 1. 문서-단어 행렬(DTM) 구축 및 동시출현 행렬 연산
+print("[*] 4단계: 단어 간 동시출현 행렬(Co-occurrence Matrix) 구축 중...")
+
+# binary=True: 한 댓글 안에 특정 단어가 5번 연속 나와도 1번 나온 것으로 취급 (과대적합 및 노이즈 뻥튀기 방지)
+vectorizer = CountVectorizer(vocabulary=vocab, binary=True)
+dtm = vectorizer.fit_transform(df_clean['final_text'].fillna(""))
+
+# DTM 전치행렬(T)과 원본행렬을 곱해 "두 단어가 같은 댓글에 몇 번 같이 등장했는지(동시출현)" 연산
+co_occurrence_matrix = np.dot(dtm.T.toarray(), dtm.toarray())
+
+# 나 자신과의 연결(예: 우울증-우울증) 횟수는 네트워크 분석에서 무의미하므로 대각선 성분을 0으로 싹 지움
+np.fill_diagonal(co_occurrence_matrix, 0)
+
+print(f"  - 동시출현 행렬 크기: {co_occurrence_matrix.shape}")
+
+# 2. NetworkX를 활용한 네트워크 그래프 구축
+print("[*] 네트워크 그래프 생성 및 중심성 지표 산출 중... (수 분이 소요될 수 있습니다)")
+
+G = nx.from_numpy_array(co_occurrence_matrix) # 숫자로 꽉 찬 넘파이 행렬을 NetworkX 그래프(거미줄 구조) 객체로 변환
+
+mapping = {i: word for i, word in enumerate(vocab)}
+G = nx.relabel_nodes(G, mapping) # 노드의 임시 숫자 이름표(0, 1, 2...)를 실제 단어 이름('정책', '청년' 등)으로 예쁘게 바꿔치기
+
+# 3. 핵심 중심성(Centrality) 지표 산출
+deg_centrality = nx.degree_centrality(G) # ① 연결정도 중심성: 이 단어가 다른 단어들과 얼마나 많이 직접 선이 그어져 있나? (단어의 인싸력/직접 영향력)
+bet_centrality = nx.betweenness_centrality(G) # ② 매개 중심성: 서로 다른 주제(군집)들 사이를 연결하는 다리(Bridge) 역할을 얼마나 하나? (정보의 길목/허브 역할)
+
+# 4. 3단계 signal_df 매트릭스와 4단계 중심성 지표 최종 결합
+# .map(): 위에서 딕셔너리 형태로 뽑아낸 점수들을 기존 signal_df의 'Keyword' 열 단어에 맞춰 찰싹 붙여줌
+signal_df['Degree_Centrality'] = signal_df['Keyword'].map(deg_centrality).fillna(0)
+signal_df['Betweenness_Centrality'] = signal_df['Keyword'].map(bet_centrality).fillna(0)
+
+print("\n[+] 4단계 완료: 시계방향 궤적(Trajectory) 지표 + SNA 중심성 지표 통합 매트릭스 완성!")
+print(signal_df[['Keyword', 'Trajectory', 'TF_Latest', 'Degree_Centrality', 'Betweenness_Centrality']].head(10))
+
+# 추후 5~6단계(토픽모델링 및 최종 시각화)를 위해 최종 통합본 저장
+output_filename = "naver_news_final_matrix.csv"
+signal_df.to_csv(output_filename, index=False, encoding='utf-8-sig') 
+print(f"[*] 통합 매트릭스가 '{output_filename}' 파일로 저장되었습니다.")
