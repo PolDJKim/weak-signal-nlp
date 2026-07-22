@@ -37,3 +37,22 @@
 ├── 06_Visualization_and_Report/
 ├── 07_Public_Data_Cross_Validation/
 └── README.md
+
+📊 Key Methodologies (핵심 분석 기법)
+DSM-5-TR 기반 임상 전처리: 단순 키워드 빈도 분석을 넘어, 임상적 유의미성을 확보하여 데이터의 신뢰도를 높였습니다.
+
+KEM-KIM Quadrant Analysis: 시계열 궤적 분석을 통해 일회성 이슈(노이즈)를 배제하고, 실제 사회적 위험으로 성장할 가능성이 높은 '진성 약신호'만을 정교하게 필터링합니다.
+
+시차 교차 상관관계 분석 (Time-lag Cross-Correlation): 도출된 온라인 약신호 트렌드 선행 지표가 실제 범죄율 및 의료 통계(HIRA/KOSIS)에 미치는 영향을 통계적으로 검증하여 예측 타당성을 확보합니다.
+
+🚀 Future Works (향후 계획)
+대시보드 프로토타입 구축: 본 7단계 파이프라인의 연산 결과를 실무 경찰관이 즉각적으로 확인하고 선제적으로 대응할 수 있도록 Streamlit 등 웹 기반의 시각화 대시보드로 발전시킬 예정입니다.
+
+LLM 기반 실시간 탐지 고도화: 거대언어모델(LLM)과의 파인튜닝 및 RAG(검색 증강 생성) 연동을 통해 위기 상황 분류 및 위험도 스코어링의 정확도와 실시간성을 극대화할 계획입니다.
+
+👤 Author
+[김동준]
+
+Email: [kkiljh@naver.com]
+
+GitHub: [github.com/PolDJKim]
