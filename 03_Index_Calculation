@@ -1,1 +1,111 @@
+# [3단계] KEM/KIM 시계열 궤적 추적 및 시계 방향 비일관성 필터링 알고리즘
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer # 단어 빈도(TF) 및 문서 등장 횟수(DF) 계산기
 
+print(" 2단계에서 정제된 데이터를 불러옵니다...")
+try:
+    df_clean = pd.read_csv("naver_news_comments_cleaned.csv")
+    df_clean['date'] = pd.to_datetime(df_clean['date']) # 텍스트로 저장된 날짜를 다시 날짜 타입(datetime)으로 복구
+except FileNotFoundError:
+    print(" 'naver_news_comments_cleaned.csv' 파일이 없습니다. 2단계를 먼저 실행해 주세요.")
+
+NUM_PERIODS = 4 # 논문 방법론에 따라 전체 기간을 4개 구간(Quarter/Period)으로 분할
+df_clean['period'] = pd.qcut(df_clean['date'], q=NUM_PERIODS, labels=[f'P{i+1}' for i in range(NUM_PERIODS)]) # 시계열 다중 분할
+print(f" 데이터를 총 {NUM_PERIODS}개의 시계열 구간으로 분할했습니다.")
+
+MIN_DF_VAL = 3 # 최소 3개 이상의 댓글에서 등장한 단어만 취급 (극단적 노이즈 제거)
+corpus_all = df_clean['final_text'].fillna("").tolist()
+
+base_vectorizer = CountVectorizer(min_df=MIN_DF_VAL, ngram_range=(1,2)) # 단일 단어(1)부터 두 단어 조합(2)까지 추출
+base_vectorizer.fit(corpus_all) 
+vocab = base_vectorizer.get_feature_names_out() # 1~4구간 통합 단어 사전(Vocabulary) 구축 완료
+
+# 구간별(P1~P4) 텍스트 묶음(corpus)과 문서 개수(doc_counts) 추출
+period_corpora = {p: df_clean[df_clean['period'] == p]['final_text'].fillna("").tolist() for p in [f'P{i+1}' for i in range(NUM_PERIODS)]}
+period_doc_counts = {p: len(period_corpora[p]) if len(period_corpora[p]) > 0 else 1 for p in [f'P{i+1}' for i in range(NUM_PERIODS)]}
+
+trajectory_data = {word: [] for word in vocab} # 단어별 1~4사분면 이동 궤적을 담을 빈 바구니 세팅 (예: [3, 3, 2, 2])
+time_weight = 0.05 # 선행연구 기준 시간가중치 (과거보다 최근 데이터에 더 가중치를 부여)
+
+for idx, p in enumerate([f'P{i+1}' for i in range(NUM_PERIODS)]):
+    corpus_p = period_corpora[p]
+    nn_j = period_doc_counts[p]
+    n_total = NUM_PERIODS
+    j_step = idx + 1 # 1부터 시작 (현재 진행 중인 구간)
+    
+    tw_multiplier = 1 - time_weight * (n_total - j_step) # 시간 가중치 적용 계수 공식: [1 - tw * (n - j)]
+    
+    tf_vec = CountVectorizer(vocabulary=vocab) # TF (가시성 DoV 재료 - 총 몇 번 쓰였나?)
+    tf_raw = np.array(tf_vec.fit_transform(corpus_p).sum(axis=0)).flatten()
+    dov_p = (tf_raw / nn_j) * tw_multiplier
+    
+    df_vec = CountVectorizer(vocabulary=vocab, binary=True) # DF (확산성 DoD 재료 - 총 몇 개의 댓글에서 등장했나? binary=True로 중복 카운트 방지)
+    df_raw = np.array(df_vec.fit_transform(corpus_p).sum(axis=0)).flatten()
+    dod_p = (df_raw / nn_j) * tw_multiplier
+    
+    # 해당 구간의 사분면을 가르는 십자가 기준선(Threshold, 중앙값) 산출
+    median_tf = np.median(tf_raw)
+    median_dov = np.median(dov_p)
+    median_df = np.median(df_raw)
+    median_dod = np.median(dod_p)
+    
+    for i, word in enumerate(vocab): # 각 단어별로 현재 구간에서의 사분면 위치 판별 후 궤적 바구니에 기록
+        tf_val = tf_raw[i]
+        dov_val = dov_p[i]
+        
+        # KEM 사분면 판별 로직 (기준선 이상/미만에 따라 1~4 구역 할당)
+        if tf_val >= median_tf and dov_val >= median_dov: q_kem = 1 # 1사분면: 강신호 (자주, 많이 쓰임)
+        elif tf_val < median_tf and dov_val >= median_dov: q_kem = 2 # 2사분면: 약신호 (빈도는 낮으나 가시성 높음)
+        elif tf_val < median_tf and dov_val < median_dov: q_kem = 3 # 3사분면: 잠재신호
+        else: q_kem = 4 # 4사분면: 잘 알려진 신호 (또는 쇠퇴 신호)
+        
+        trajectory_data[word].append(q_kem) 
+
+print("미래신호 비일관성 필터링(시계 방향 진화 패턴 검증) 수행 중...")
+
+def check_clockwise_evolution(history): # 궤적(history)을 보고 진성 약신호인지 판별하는 함수
+    # 논리: 잠재(3) ➔ 약신호(2) ➔ 강신호(1) 순서의 '시계 방향' 오름차순 진화만 합격!
+    final_pos = history[-1]
+    if final_pos not in [1, 2]: # 마지막 4분기(P4) 시점에는 최소 약신호(2)나 강신호(1) 영역에 도달해 있어야 함
+        return False
+        
+    unique_jumps = len(set(history))
+    if unique_jumps >= 3 and history[0] == 1: # 1 -> 3 -> 1 처럼 역주행하거나 핑퐁 치는 노이즈(가짜 신호) 탈락
+        return False
+        
+    return True
+
+final_records = []
+for word in vocab:
+    history = trajectory_data[word]
+    is_valid_signal = check_clockwise_evolution(history) # 필터링 함수 통과 여부 (True/False)
+    
+    # 마지막 P4 구간의 데이터만 최종값으로 추출
+    final_tf = np.array(CountVectorizer(vocabulary=[word]).fit_transform(period_corpora['P4']).sum(axis=0)).flatten()[0]
+    final_df = np.array(CountVectorizer(vocabulary=[word], binary=True).fit_transform(period_corpora['P4']).sum(axis=0)).flatten()[0]
+    
+    final_records.append({
+        'Keyword': word,
+        'Trajectory': history, # 시계열 이동 궤적 (예: [3, 2, 2, 1])
+        'Is_Valid_Evolution': is_valid_signal, # 진성 신호 여부
+        'TF_Latest': final_tf,
+        'DF_Latest': final_df,
+        'Latest_KEM_Quadrant': history[-1] # 최종 사분면 위치
+    })
+
+signal_df = pd.DataFrame(final_records)
+
+# 조건: 1) 시계 방향 진화 검증 통과 (True) & 2) 최종 시점에 정확히 '약신호(2사분면)'에 위치한 단어들만 최종 추출
+final_weak_signals = signal_df[
+    (signal_df['Is_Valid_Evolution'] == True) & (signal_df['Latest_KEM_Quadrant'] == 2)
+].sort_values(by='TF_Latest', ascending=False).reset_index(drop=True)
+
+signal_df.to_csv("naver_news_kem_kim_matrix.csv", index=False, encoding='utf-8-sig') # 4단계를 위해 전체 매트릭스 저장
+
+print(" 🚨 [고도화 완료] 비일관성 필터링을 통과한 진짜 위기 약신호 (Weak Signals)")
+if not final_weak_signals.empty:
+    print(final_weak_signals[['Keyword', 'Trajectory', 'TF_Latest', 'DF_Latest']].head(15).to_string(index=False))
+else:
+    print("[-] 조건에 부합하는 진성 약신호가 없습니다. 데이터 기간을 넓히거나 세부 구간(NUM_PERIODS)을 조정해 보세요.")
+print('='*80)
