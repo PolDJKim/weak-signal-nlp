@@ -1,1 +1,161 @@
+# [1단계 Data_Collection] 다중 키워드 하이브리드 수집 파이프라인
+import requests
+import json
+import pandas as pd
+import re #Regular Expression, 패턴 탐정 로봇
+import time
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
+def collect_naver_news_urls(query, start_date, end_date, max_pages=3): # 1. Selenium 기사 주소 수집 
+    print(f"\n브라우저를 열어 '{query}' 뉴스 링크 수집을 시작합니다. (목표: {max_pages}쪽)")
+    options = Options() #Selenium이 크롬을 실행할 때 적용할 "설정값 묶음" 객체를 생성.
+    options.add_argument("disable-blink-features=AutomationControlled") #크롬이 "이거 자동화 도구가 조종하는 브라우저다"라고 스스로 표시하는 흔적을 숨기는 옵션
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")#User-Agent를 일반적인 윈도우+크롬 브라우저처럼 보이도록 지정
+    
+    driver = webdriver.Chrome(options=options) #옵션을 적용해서 실제 크롬 브라우저 창 실행. (headless 옵션이 없으니 화면에 보이는 상태로 실행됨).
+    collected_urls = []
+
+    for page in range(1, max_pages + 1): #page가 1부터 max_pages까지 순서대로 돔. (max_pages=3이면 1, 2, 3)
+        start_val = (page - 1) * 10 + 1
+        search_url = f"https://search.naver.com/search.naver?where=news&query={query}&sort=2&pd=3&ds={start_date}&de={end_date}&start={start_val}"
+        driver.get(search_url)
+        time.sleep(2) 
+        
+        soup = BeautifulSoup(driver.page_source, 'html.parser') #driver.page_source: 현재 브라우저에 렌더링된 페이지의 HTML 전체 텍스트.
+        links = soup.find_all("a") #HTML 안의 모든 <a> 태그(하이퍼링크 태그)를 리스트로 찾아옴.
+        for link in links: #<a> 태그를 순회하면서 href 속성(실제 링크 주소)을 꺼냄. href 속성이 없는 경우를 대비해 기본값으로 빈 문자열 ''을 지정.
+            href = link.get('href', '')
+            if "n.news.naver.com" in href and "article" in href: #광고 링크, 다른 섹션 링크 등을 걸러내는 필터 역할
+                collected_urls.append(href)
+                
+        print(f"  - 검색결과 {page}페이지 완료 (현재 확보된 기사: {len(set(collected_urls))}개)")
+        
+    driver.quit() #좀비프로세스 방지
+    unique_urls = list(set(collected_urls)) #set은 중복을 없애줌
+    print(f" 최종 수집된 고유 네이버 뉴스 기사 링크: {len(unique_urls)}개\n")
+    return unique_urls
+
+def get_naver_comments_api(news_url, session): # 2. API 댓글 수집
+    match = re.search(r'article/(\d+)/(\d+)', news_url) #article/digit(숫자)한개이상/digit한개이상, groups()을 위해서 ()괄호로 \d+를 패키징
+    if not match:
+        return pd.DataFrame()
+        
+    oid, aid = match.groups() #article/025/0003254631 -> ('025', '0003254631') OfficeID, ArticleID
+    object_id = f"news{oid},{aid}" #네이버 댓글 API 서식에 맞춤 (댓글을 요청할 때)
+    
+    try:  # 봇 차단 방지를 위한 기사 선방문 (쿠키 획득)
+        session.get(news_url, timeout=5) #session = global_session = requests.Session()으로 나중에 지정
+    except:
+        pass
+        
+    headers = {"Referer": news_url} #바로 직전에 기사 본문 페이지에 머물다가 여기로 왔어요 라는 뜻
+    api_url = "https://apis.naver.com/commentBox/cbox/web_naver_list_jsonp.json"
+    comments_data = [] #최종, 리스트 안의 딕셔너리 형태
+    page = 1
+    seen_comment_ids = set()
+    
+    while True: #조건 없이 무한 반복. 안에서 break로만 빠져나갈 수 있음.
+        params = {
+            'ticket': 'news',
+            'templateId': 'default_society',
+            'pool': 'cbox5',
+            'lang': 'ko',
+            'country': 'KR',
+            'objectId': object_id,
+            'pageSize': 100,      
+            'page': page,
+            'sort': 'NEW',  #최신순
+            'cleanbot': 'false'   
+        }
+        
+        try: # session을 사용해 API 호출
+            response = session.get(api_url, headers=headers, params=params, timeout=5) #_naver_callback_12345( {"result": {"commentList": ["꿀잼 기사네요!", "공감합니다"]}} );
+            json_text = re.sub(r'^[^(]*\((.*)\)[^)]*$', r'\1', response.text) #re.sub(찾을 패턴, 바꿀 내용, 원본 텍스트) ->{"result": {"commentList": ["꿀잼 기사네요!", "공감합니다"]}}
+            data = json.loads(json_text) #String으로 되어있는 json데이터를 불러와서 딕셔너리로
+            
+            comments_list = data.get('result', {}).get('commentList', []) #방어코드
+            if not comments_list: #이번 페이지에 댓글이 하나도 없으면 → 더 이상 수집할 게 없다는 뜻이니 루프 종료.
+                break
+                
+            new_comments_count = 0
+            for comment in comments_list:
+                comment_no = comment['commentNo'] #중복검사 하기위해 댓글 고유번호 미리 빼놓음
+                if comment_no in seen_comment_ids: #이 번호가 이미 수집했던 번호(seen_comment_ids)인지 검사
+                    continue
+                seen_comment_ids.add(comment_no)
+                new_comments_count += 1 #new_comments_count는 "이번 페이지에서 진짜 새로 발견한 댓글이 몇 개인지" 카운트
+                
+                if comment['deleted']:
+                    continue #최종 데이터에는 담지 않고 건너뜀
+                    
+                comments_data.append({
+                    'comment_no': comment_no, #댓글 고유번호
+                    'date': comment['regTime'], #작성시간
+                    'text': comment['contents'],
+                    'sympathy_count': comment['sympathyCount'], #좋아요 수
+                    'antipathy_count': comment['antipathyCount'], #싫어요 수
+                    'origin_news_url': news_url
+                })
+            
+            if new_comments_count == 0:
+                print(f"에러가 발생했습니다! 원인: {e}")
+                break
+            
+            page += 1
+            time.sleep(0.3) 
+            
+        except Exception as e:
+            break
+
+    return pd.DataFrame(comments_data) #뒤에서 df_temp로 받을 것임
+
+# 3. 통합 실행 파트
+SEARCH_KEYWORDS = ["심신미약", "조현병", "묻지마 범죄", "니트족", "청년 백수", "우울증", "극단적 선택"] 
+SEARCH_PAGES = 3
+start_date = "2025.01.01"
+end_date = "2025.12.31"
+all_comments_df = pd.DataFrame()
+
+# 전역 세션(Session) 한 번만 생성
+global_session = requests.Session()  #쿠키가 자동으로 유지 #get_naver_comments_api의 session변수에 넣는 것
+global_session.headers.update({ #쿠키가 자동으로 유지
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+})
+
+for keyword in SEARCH_KEYWORDS: # 키워드 루프 시작 
+    print(f"▶ [{keyword}] 키워드 데이터 파이프라인 가동!")
+    
+    news_urls = collect_naver_news_urls(query=keyword, start_date=start_date, end_date=end_date, max_pages=SEARCH_PAGES)     # 1) 현재 키워드로 뉴스 링크 수집
+    
+    if news_urls:    # 수집된 링크가 있다면, "현재 루프 안에서 바로" 댓글을 수집!
+        print(f" '{keyword}' 관련 뉴스 기사들의 댓글을 순차적으로 수집합니다...")
+        for i, url in enumerate(news_urls): #리스트를 돌면서 동시에 "몇 번째인지" 번호도 같이 챙겨주는 기능
+            print(f"  [{i+1}/{len(news_urls)}] 기사 댓글 수집 중... (URL: {url})") #i는 0부터 시작하므로
+            
+            df_temp = get_naver_comments_api(url, global_session)
+            
+            if not df_temp.empty: #df_temp 데이터프레임이 "비어있는지 아닌지"
+                df_temp['Search_Keyword'] = keyword # 어느 키워드로 수집했는지 꼬리표(Tag) 달아주기
+                all_comments_df = pd.concat([all_comments_df, df_temp], ignore_index=True) #수집한 댓글 누적시키기
+                print(f" 성공적으로 {len(df_temp)}개의 댓글을 수집했습니다.")
+            else:
+                print(" 수집할 댓글이 없거나 올바르지 않은 링크입니다.")
+            
+            time.sleep(0.4) # 기사 간 딜레이 대기
+    else: #수집된 링크가 없다면
+        print(f"'{keyword}'에 대한 기사 링크를 찾지 못했습니다.")
+
+if not all_comments_df.empty: # 4. 최종 데이터 정제 및 저장
+    all_comments_df['date'] = pd.to_datetime(all_comments_df['date']) #datetime으로 전환
+    all_comments_df = all_comments_df.sort_values(by='date').reset_index(drop=True)
+    all_comments_df = all_comments_df.drop_duplicates(subset=['text'], keep='first') #처음것만 남기고 중복 삭제 text 기준
+    
+    output_filename = "naver_news_comments_raw.csv"
+    all_comments_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+    
+    print(f"\n[🎉] 최종 완료! 총 {len(all_comments_df)}건의 유효 댓글이 '{output_filename}'에 저장되었습니다.")
+    print(all_comments_df[['Search_Keyword', 'date', 'text', 'sympathy_count']].head(10))
+else:
+    print("\n[-] 수집된 데이터가 없습니다.")
