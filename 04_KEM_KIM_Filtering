@@ -1,54 +1,200 @@
-# [4단계] 의미 연결망 분석 (SNA) 및 중심성 지표 산출 알고리즘
 import pandas as pd
 import numpy as np
-import networkx as nx
+import ast
 from sklearn.feature_extraction.text import CountVectorizer
+import warnings
+warnings.filterwarnings('ignore')
 
-print("[*] 2단계(정제 데이터) 및 3단계(궤적추적 매트릭스) 파일을 불러오는 중...")
-try:
-    df_clean = pd.read_csv("naver_news_comments_cleaned.csv")
-    signal_df = pd.read_csv("naver_news_kem_kim_matrix.csv")
+# =========================================================
+# Stage 4: KEM/KIM 시계열 지표 산출 및 비일관성 필터링 모듈
+# =========================================================
+
+def track_and_filter_signals(input_filename, matrix_filename, report_filename, data_type, num_periods=4, time_weight=0.05):
+    print(f"\n{'='*70}")
+    print(f"[*] [{data_type}] KEM/KIM 지표 산출 및 비일관성 필터링 시작!")
+    print(f"{'='*70}")
     
-    vocab = signal_df['Keyword'].tolist() # 3단계에서 확정된 공통 단어장(Keyword)을 리스트로 쏙 뽑아서 기준점으로 삼음
-except FileNotFoundError:
-    print("[-] 필요 파일이 없습니다. 2단계와 3단계를 먼저 실행해 주세요.")
+    # ---------------------------------------------------------
+    # 1. 전처리된 데이터 불러오기 및 텍스트/시계열 복원
+    # ---------------------------------------------------------
+    try:
+        df_clean = pd.read_csv(input_filename)
+        # 날짜 타입 복구
+        df_clean['date'] = pd.to_datetime(df_clean['date']) 
+        
+        # Stage 2에서 저장된 'tokens' 문자열 리스트를 실제 파이썬 리스트로 변환 후 결합
+        df_clean['tokens'] = df_clean['tokens'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+        df_clean['final_text'] = df_clean['tokens'].apply(lambda x: ' '.join(x))
+        
+    except FileNotFoundError:
+        print(f"[-] '{input_filename}' 파일이 없습니다. Stage 2를 먼저 실행해 주세요.")
+        return
 
-# 1. 문서-단어 행렬(DTM) 구축 및 동시출현 행렬 연산
-print("[*] 4단계: 단어 간 동시출현 행렬(Co-occurrence Matrix) 구축 중...")
+    # 논문 방법론에 따라 전체 기간을 지정된 개수(기본 4분위)로 균등 분할
+    df_clean['period'] = pd.qcut(df_clean['date'], q=num_periods, labels=[f'P{i+1}' for i in range(num_periods)])
+    print(f"  - 데이터를 총 {num_periods}개의 시계열 구간(P1~P{num_periods})으로 분할했습니다.")
+    
+    # ---------------------------------------------------------
+    # 2. 통합 단어 사전(Vocabulary) 구축
+    # ---------------------------------------------------------
+    MIN_DF_VAL = 3 # 극단적 노이즈 제거: 최소 3개 이상의 문서에서 등장한 단어만 취급
+    corpus_all = df_clean['final_text'].fillna("").tolist()
 
-# binary=True: 한 댓글 안에 특정 단어가 5번 연속 나와도 1번 나온 것으로 취급 (과대적합 및 노이즈 뻥튀기 방지)
-vectorizer = CountVectorizer(vocabulary=vocab, binary=True)
-dtm = vectorizer.fit_transform(df_clean['final_text'].fillna(""))
+    # N-gram(1,2) 적용: 단일 단어 및 두 단어 조합(예: "묻지마 범죄") 모두 추출
+    base_vectorizer = CountVectorizer(min_df=MIN_DF_VAL, ngram_range=(1,2)) 
+    base_vectorizer.fit(corpus_all) 
+    vocab = base_vectorizer.get_feature_names_out() 
 
-# DTM 전치행렬(T)과 원본행렬을 곱해 "두 단어가 같은 댓글에 몇 번 같이 등장했는지(동시출현)" 연산
-co_occurrence_matrix = np.dot(dtm.T.toarray(), dtm.toarray())
+    # 구간별(P1~Pn) 텍스트 묶음(corpus) 및 문서 개수 추출
+    period_corpora = {p: df_clean[df_clean['period'] == p]['final_text'].fillna("").tolist() for p in [f'P{i+1}' for i in range(num_periods)]}
+    period_doc_counts = {p: len(period_corpora[p]) if len(period_corpora[p]) > 0 else 1 for p in [f'P{i+1}' for i in range(num_periods)]}
 
-# 나 자신과의 연결(예: 우울증-우울증) 횟수는 네트워크 분석에서 무의미하므로 대각선 성분을 0으로 싹 지움
-np.fill_diagonal(co_occurrence_matrix, 0)
+    # 단어별 궤적 추적 바구니 생성
+    trajectory_data_kem = {word: [] for word in vocab} 
+    trajectory_data_kim = {word: [] for word in vocab} 
 
-print(f"  - 동시출현 행렬 크기: {co_occurrence_matrix.shape}")
+    # ---------------------------------------------------------
+    # 3. 구간별 가중치 적용 지표(DoV, DoD) 산출 및 사분면 판별
+    # ---------------------------------------------------------
+    for idx, p in enumerate([f'P{i+1}' for i in range(num_periods)]):
+        corpus_p = period_corpora[p]
+        nn_j = period_doc_counts[p]
+        n_total = num_periods
+        j_step = idx + 1 # 현재 진행 중인 구간 (1~4)
+        
+        # 시간가중치 공식: [1 - tw * (n - j)]
+        tw_multiplier = 1 - time_weight * (n_total - j_step) 
+        
+        # TF 산출 (총 등장 횟수 기반 가시성 재료)
+        tf_vec = CountVectorizer(vocabulary=vocab, ngram_range=(1,2))
+        tf_raw = np.array(tf_vec.fit_transform(corpus_p).sum(axis=0)).flatten()
+        dov_p = (tf_raw / nn_j) * tw_multiplier
+        
+        # DF 산출 (문서 등장 횟수 기반 확산성 재료, binary=True)
+        df_vec = CountVectorizer(vocabulary=vocab, ngram_range=(1,2), binary=True) 
+        df_raw = np.array(df_vec.fit_transform(corpus_p).sum(axis=0)).flatten()
+        dod_p = (df_raw / nn_j) * tw_multiplier
+        
+        # 해당 구간 사분면 분할 기준선: 중앙값(Median)
+        median_tf = np.median(tf_raw)
+        median_dov = np.median(dov_p)
+        median_df = np.median(df_raw)
+        median_dod = np.median(dod_p)
+        
+        for i, word in enumerate(vocab):
+            tf_val = tf_raw[i]
+            dov_val = dov_p[i]
+            df_val = df_raw[i]
+            dod_val = dod_p[i]
+            
+            # [KEM 사분면 판별]
+            if tf_val >= median_tf and dov_val >= median_dov: q_kem = 1   # 강신호
+            elif tf_val < median_tf and dov_val >= median_dov: q_kem = 2  # 약신호
+            elif tf_val < median_tf and dov_val < median_dov: q_kem = 3   # 잠재신호
+            else: q_kem = 4                                               # 잘 알려진 신호
+            
+            # [KIM 사분면 판별]
+            if df_val >= median_df and dod_val >= median_dod: q_kim = 1
+            elif df_val < median_df and dod_val >= median_dod: q_kim = 2
+            elif df_val < median_df and dod_val < median_dod: q_kim = 3
+            else: q_kim = 4
+            
+            trajectory_data_kem[word].append(q_kem) 
+            trajectory_data_kim[word].append(q_kim)
 
-# 2. NetworkX를 활용한 네트워크 그래프 구축
-print("[*] 네트워크 그래프 생성 및 중심성 지표 산출 중... (수 분이 소요될 수 있습니다)")
+    # ---------------------------------------------------------
+    # 4. 미래신호 비일관성 필터링 (시계 방향 진화 패턴 검증)
+    # ---------------------------------------------------------
+    print(f"  - [{data_type}] 미래신호 비일관성 필터링 수행 중...")
 
-G = nx.from_numpy_array(co_occurrence_matrix) # 숫자로 꽉 찬 넘파이 행렬을 NetworkX 그래프(거미줄 구조) 객체로 변환
+    def check_clockwise_evolution(history): 
+        # 논리: 잠재(3) -> 약신호(2) -> 강신호(1) 순서의 오름차순 진화 검증
+        final_pos = history[-1]
+        if final_pos not in [1, 2]: # 마지막 시점엔 최소 약신호(2) 이상이어야 함
+            return False
+            
+        unique_jumps = len(set(history))
+        # 1 -> 3 -> 1 과 같은 핑퐁(역주행) 노이즈 차단
+        if unique_jumps >= 3 and history[0] == 1: 
+            return False
+            
+        return True
 
-mapping = {i: word for i, word in enumerate(vocab)}
-G = nx.relabel_nodes(G, mapping) # 노드의 임시 숫자 이름표(0, 1, 2...)를 실제 단어 이름('정책', '청년' 등)으로 예쁘게 바꿔치기
+    final_records = []
+    final_period_key = f'P{num_periods}'
+    
+    # 최신 시점(P4)의 TF/DF를 빠르게 계산하기 위한 벡터라이저
+    final_tf_vec = CountVectorizer(vocabulary=vocab, ngram_range=(1,2))
+    final_df_vec = CountVectorizer(vocabulary=vocab, ngram_range=(1,2), binary=True)
+    
+    final_tf_matrix = np.array(final_tf_vec.fit_transform(period_corpora[final_period_key]).sum(axis=0)).flatten()
+    final_df_matrix = np.array(final_df_vec.fit_transform(period_corpora[final_period_key]).sum(axis=0)).flatten()
 
-# 3. 핵심 중심성(Centrality) 지표 산출
-deg_centrality = nx.degree_centrality(G) # ① 연결정도 중심성: 이 단어가 다른 단어들과 얼마나 많이 직접 선이 그어져 있나? (단어의 인싸력/직접 영향력)
-bet_centrality = nx.betweenness_centrality(G) # ② 매개 중심성: 서로 다른 주제(군집)들 사이를 연결하는 다리(Bridge) 역할을 얼마나 하나? (정보의 길목/허브 역할)
+    for i, word in enumerate(vocab):
+        history_kem = trajectory_data_kem[word]
+        history_kim = trajectory_data_kim[word]
+        
+        # KEM 기준 진성 신호 여부
+        is_valid_signal = check_clockwise_evolution(history_kem) 
+        
+        final_records.append({
+            'Keyword': word,
+            'Trajectory_KEM': history_kem,
+            'Trajectory_KIM': history_kim,
+            'Is_Valid_Evolution': is_valid_signal,
+            'TF_Latest': final_tf_matrix[i],
+            'DF_Latest': final_df_matrix[i],
+            'Latest_KEM_Quadrant': history_kem[-1],
+            'Latest_KIM_Quadrant': history_kim[-1] 
+        })
 
-# 4. 3단계 signal_df 매트릭스와 4단계 중심성 지표 최종 결합
-# .map(): 위에서 딕셔너리 형태로 뽑아낸 점수들을 기존 signal_df의 'Keyword' 열 단어에 맞춰 찰싹 붙여줌
-signal_df['Degree_Centrality'] = signal_df['Keyword'].map(deg_centrality).fillna(0)
-signal_df['Betweenness_Centrality'] = signal_df['Keyword'].map(bet_centrality).fillna(0)
+    signal_df = pd.DataFrame(final_records)
+    # 전체 궤적 매트릭스 저장 (논문 부록 데이터용)
+    signal_df.to_csv(matrix_filename, index=False, encoding='utf-8-sig') 
 
-print("\n[+] 4단계 완료: 시계방향 궤적(Trajectory) 지표 + SNA 중심성 지표 통합 매트릭스 완성!")
-print(signal_df[['Keyword', 'Trajectory', 'TF_Latest', 'Degree_Centrality', 'Betweenness_Centrality']].head(10))
+    # 진성 약신호 추출: 1) 일관성 검증 통과 2) KEM과 KIM 모두 최종 시점에 '약신호(2)'
+    final_weak_signals = signal_df[
+        (signal_df['Is_Valid_Evolution'] == True) & 
+        (signal_df['Latest_KEM_Quadrant'] == 2) &
+        (signal_df['Latest_KIM_Quadrant'] == 2)
+    ].sort_values(by='TF_Latest', ascending=False).reset_index(drop=True)
 
-# 추후 5~6단계(토픽모델링 및 최종 시각화)를 위해 최종 통합본 저장
-output_filename = "naver_news_final_matrix.csv"
-signal_df.to_csv(output_filename, index=False, encoding='utf-8-sig') 
-print(f"[*] 통합 매트릭스가 '{output_filename}' 파일로 저장되었습니다.")
+    # ---------------------------------------------------------
+    # 5. 결과 리포팅 및 저장
+    # ---------------------------------------------------------
+    print('\n' + '-'*70)
+    print(f" 🚨 [{data_type}] 필터링 통과 진성 약신호 (True Weak Signals)")
+    print('-'*70)
+    if not final_weak_signals.empty:
+        print(final_weak_signals[['Keyword', 'Trajectory_KEM', 'Trajectory_KIM', 'TF_Latest', 'DF_Latest']].head(10).to_string(index=False))
+        final_weak_signals.to_csv(report_filename, index=False, encoding='utf-8-sig')
+        print(f"\n  -> 상위 약신호가 '{report_filename}'에 저장되었습니다.")
+    else:
+        print("  [-] 조건에 부합하는 진성 약신호가 없습니다.")
+    print('-'*70)
+
+# =========================================================
+# 실행부 (Stage 2 출력물 활용)
+# =========================================================
+if __name__ == "__main__":
+    # 1) 뉴스 기사 (공식 담론) 처리
+    track_and_filter_signals(
+        input_filename="news_preprocessed.csv",
+        matrix_filename="news_kem_kim_matrix.csv",
+        report_filename="news_weak_signals_report.csv",
+        data_type="뉴스 기사(공식 담론)",
+        num_periods=4,
+        time_weight=0.05
+    )
+
+    # 2) 뉴스 댓글 (대중 여론) 처리
+    track_and_filter_signals(
+        input_filename="comments_preprocessed.csv",
+        matrix_filename="comments_kem_kim_matrix.csv",
+        report_filename="comments_weak_signals_report.csv",
+        data_type="뉴스 댓글(대중 여론)",
+        num_periods=4,
+        time_weight=0.05
+    )
+
+    print("\n[🎉 Stage 4 완료] 핵심 궤적 추적 및 비일관성 필터링을 성공적으로 마쳤습니다!")
