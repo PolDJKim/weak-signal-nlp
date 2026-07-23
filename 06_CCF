@@ -1,0 +1,124 @@
+# ==========================================
+# Stage 6: 연구 가설 검증 (H1) - 시차교차상관(CCF) 분석 모듈
+# ==========================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.stattools import ccf
+import warnings
+warnings.filterwarnings('ignore')
+
+# 그래프 폰트 및 시각화 환경 세팅 (한글 깨짐 방지)
+plt.rcParams['font.family'] = 'Malgun Gothic'  # 💡 맥(Mac) 유저는 'AppleGothic'으로 변경
+plt.rcParams['axes.unicode_minus'] = False 
+
+print("\n[Stage 6] 대중 여론 선행성 검증(H1)을 위한 시차교차상관(CCF) 분석을 시작합니다.")
+
+# 1. 5단계에서 생성된 허브 월별 트렌드 데이터 로드
+try:
+    comments_trend = pd.read_csv("comments_hub_monthly_trends.csv")
+    news_trend = pd.read_csv("news_hub_monthly_trends.csv")
+    print("  - 허브 월별 트렌드 데이터를 성공적으로 불러왔습니다.")
+except FileNotFoundError:
+    print("  - [오류] 5단계 결과 파일('comments_hub_monthly_trends.csv' 또는 'news_hub_monthly_trends.csv')을 찾을 수 없습니다.")
+    print("    Stage 5를 먼저 실행하여 트렌드 파일을 생성해 주세요.")
+    exit()
+
+# 2. 날짜(Month) 기준으로 데이터 통합 (공통 타임라인 구축)
+merged_df = pd.merge(comments_trend, news_trend, on='date', how='inner').sort_values('date').reset_index(drop=True)
+
+if merged_df.empty:
+    print("  - [오류] 댓글과 뉴스 간에 시기가 겹치는 공통 월별 데이터가 없습니다.")
+    exit()
+
+# 3. 양측 데이터에 공통으로 존재하는 허브 키워드 추출
+comment_cols = [c.replace('_score', '') for c in comments_trend.columns if c != 'date']
+news_cols = [c.replace('_score', '') for c in news_trend.columns if c != 'date']
+common_hubs = list(set(comment_cols) & set(news_cols))
+
+print(f"  - 교차 검증 대상 공통 뇌관(Hub) 키워드: {common_hubs}")
+
+validation_results = []
+
+# 4. 공통 허브별 시차교차상관(CCF) 분석 수행
+for hub in common_hubs:
+    score_col = f"{hub}_score"
+    
+    # 각각의 시계열 스코어 추출
+    cmt_series = merged_df[f"{score_col}_x" if f"{score_col}_x" in merged_df.columns else score_col].values.astype(float)
+    # 컬럼명이 merge 과정에서 충돌날 경우 대비한 예외 안전장치
+    try:
+        cmt_series = merged_df[f"{score_col}_x"].values.astype(float)
+        news_series = merged_df[f"{score_col}_y"].values.astype(float)
+    except KeyError:
+        cmt_series = merged_df[score_col].values.astype(float)
+        news_series = merged_df[score_col].values.astype(float)
+
+    if len(cmt_series) < 3 or np.sum(cmt_series) == 0 or np.sum(news_series) == 0:
+        print(f"  - [{hub}] 데이터가 부족하거나 빈 값이어서 검증을 건너뜁니다.")
+        continue
+        
+    # 데이터 정규화 (Standardization)를 통한 CCF 안정성 확보
+    cmt_norm = (cmt_series - np.mean(cmt_series)) / (np.std(cmt_series) + 1e-9)
+    news_norm = (news_series - np.mean(news_series)) / (np.std(news_series) + 1e-9)
+    
+    # 시차교차상관(Lagged Cross-Correlation) 계산
+    # statsmodels의 ccf 함수 활용 (댓글 시계열이 뉴스 시계열에 미치는 영향 분석)
+    correlations = ccf(cmt_norm, news_norm, adjusted=False)
+    
+    # 유효한 시차(Lag) 범위 설정 (전체 데이터 길이의 절반 또는 최대 6개월)
+    max_lag_range = min(len(correlations) // 2, 6)
+    if max_lag_range < 1: max_lag_range = 1
+    
+    lag_subset = correlations[:max_lag_range]
+    
+    best_lag = np.argmax(lag_subset)
+    max_corr = lag_subset[best_lag]
+    
+    # H1 가설 검증 조건: 
+    # 1) 최적 시차(Lag)가 양(+)의 값인가? (k > 0 이면 댓글 여론이 뉴스를 선행함)
+    # 2) 최대 상관계수가 유의미한 수준(r > 0.3 이상)인가?
+    is_preceding = best_lag > 0 and max_corr >= 0.3
+    
+    validation_results.append({
+        'Hub_Keyword': hub,
+        'Optimal_Lag_Months': best_lag,
+        'Max_Correlation_Coefficient': round(max_corr, 3),
+        'H1_Hypothesis_Status': 'Accepted (채택)' if is_preceding else 'Rejected (기각)'
+    })
+    
+    print(f"\n  ▶ [Hub 키워드: '{hub}'] 분석 결과")
+    print(f"     - 최적 시차(Lag k): {best_lag}개월 (양(+)의 값은 댓글 여론의 선행을 의미)")
+    print(f"     - 최대 상관계수 (r): {max_corr:.3f}")
+    print(f"     - H1 가설 검증 결과: {'채택 (대중 여론이 공식 보도에 통계적으로 선행함)' if is_preceding else '기각'}")
+
+    # 5. 논문 삽입용 CCF 분석 결과 시각화 그래프 저장
+    plt.figure(figsize=(8, 4))
+    plt.stem(range(len(lag_subset)), lag_subset, linefmt='b-', markerfmt='bo', basefmt='r-')
+    plt.title(f'Lagged Cross-Correlation (CCF) - Hub: "{hub}"', fontsize=12, fontweight='bold')
+    plt.xlabel('Lag (Months, Comments -> News)', fontsize=10)
+    plt.ylabel('Correlation Coefficient (r)', fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.axhline(0.3, color='crimson', linestyle='--', linewidth=1, label='Significance Threshold (0.3)')
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    
+    plot_name = f"{hub}_CCF_Validation_Plot.png"
+    plt.savefig(plot_name, dpi=300)
+    plt.close()
+    print(f"     -> 시각화 그래프 저장 완료: '{plot_name}'")
+
+# 6. 최종 가설 검증 요약 리포트 저장
+if validation_results:
+    result_df = pd.DataFrame(validation_results)
+    output_filename = "hypothesis_H1_final_validation_result.csv"
+    result_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+    
+    print("\n" + "="*70)
+    print(" 🏆 [Stage 6 완료] 연구 가설(H1) 최종 검증 요약 리포트")
+    print("="*70)
+    print(result_df.to_string(index=False))
+    print(f"\n  -> 전체 검증 결과가 '{output_filename}' 파일로 안전하게 저장되었습니다.")
+    print("="*70)
+else:
+    print("\n  [-] 검증을 완료한 공통 허브 키워드가 없습니다.")
