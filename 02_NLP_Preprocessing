@@ -1,0 +1,73 @@
+# ==========================================
+# Stage 2: 자연어 전처리 및 노이즈 필터링 (NLP Preprocessing)
+# ==========================================
+import pandas as pd
+import re
+import ast
+from kiwipiepie import Kiwi
+import warnings
+warnings.filterwarnings('ignore')
+
+print("\n[Stage 2] 이원적 데이터 병렬 전처리 및 노이즈 필터링을 시작합니다.")
+
+# 1. 형태소 분석기 초기화 및 범죄심리학 도메인 사용자 사전 추가
+kiwi = Kiwi()
+custom_words = ['이상동기', '묻지마', '은둔형', '외톨이', '사이코패스', '소시오패스', '모방범죄']
+for word in custom_words:
+    kiwi.add_user_word(word, 'NNG') # 일반 명사로 강제 등록
+
+# 2. 추출 태그 및 불용어 세팅
+valid_tags = ['NNG', 'NNP', 'VV', 'VA'] # 명사, 동사, 형용사
+stop_words = set(['기자', '뉴스', '보도', '경찰', '범죄', '사건', '발생', '수사', '관련', '대해', '위해', '하다', '되다', '있다', '없다']) 
+
+# 3. 텍스트 정제 및 형태소 분석 함수
+def clean_text(text):
+    """URL, 특수문자, 단독 자음/모음 제거"""
+    if not isinstance(text, str): return ""
+    text = re.sub(r'http\S+', '', text) # URL 제거
+    text = re.sub(r'[^가-힣a-zA-Z\s]', ' ', text) # 한글, 영문, 공백만 남김
+    return text
+
+def preprocess_text(text):
+    """정제된 텍스트에서 2글자 이상의 유효 형태소만 추출"""
+    cleaned_text = clean_text(text)
+    if not cleaned_text.strip():
+        return []
+    
+    tokens = kiwi.tokenize(cleaned_text)
+    # 태그 확인 -> 불용어 제외 -> 2글자 이상 단어만 추출
+    return [t.form for t in tokens if t.tag in valid_tags and t.form not in stop_words and len(t.form) >= 2]
+
+# 4. 1단계 수집 데이터 로드
+try:
+    news_df = pd.read_csv("news_raw_data.csv")
+    comments_df = pd.read_csv("comments_raw_data.csv")
+    print("  - 원본 데이터를 성공적으로 불러왔습니다.")
+except FileNotFoundError:
+    print("  - [오류] 1단계 수집 데이터(CSV)를 찾을 수 없습니다.")
+    exit()
+
+# 5. 결측치 제거 및 시계열(월별) 컬럼 생성
+news_df = news_df.dropna(subset=['body', 'date'])
+comments_df = comments_df.dropna(subset=['text', 'date'])
+
+news_df['period'] = pd.to_datetime(news_df['date']).dt.to_period('M')
+comments_df['period'] = pd.to_datetime(comments_df['date']).dt.to_period('M')
+
+# 6. 병렬 전처리 수행
+print("  - 공식 보도(뉴스 기사) 형태소 분석 중... (시간이 소요될 수 있습니다)")
+news_df['tokens'] = news_df['body'].apply(preprocess_text)
+
+print("  - 대중 여론(댓글) 형태소 분석 중... (시간이 소요될 수 있습니다)")
+comments_df['tokens'] = comments_df['text'].apply(preprocess_text)
+
+# 7. [중요] 3단계를 위한 전처리 결과물 별도 저장 (체크포인트)
+# 토큰이 비어있는 행(노이즈로만 이루어졌던 텍스트 등) 제거
+news_df = news_df[news_df['tokens'].map(len) > 0]
+comments_df = comments_df[comments_df['tokens'].map(len) > 0]
+
+news_df.to_csv("news_preprocessed.csv", index=False, encoding='utf-8-sig')
+comments_df.to_csv("comments_preprocessed.csv", index=False, encoding='utf-8-sig')
+
+print(f"  - [Stage 2 완료] 전처리된 뉴스({len(news_df)}건) 및 댓글({len(comments_df)}건) 데이터 저장 완료")
+print("  - 'news_preprocessed.csv', 'comments_preprocessed.csv' 파일이 생성되었습니다.")
